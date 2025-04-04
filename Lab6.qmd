@@ -2,6 +2,8 @@
 title: "Lab6.qmd"
 author: Kate Laidlaw
 date: 2025/04/04
+output-dir: docs
+type: website
 format: 
   html:
     self-contained: TRUE
