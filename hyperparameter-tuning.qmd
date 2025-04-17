@@ -1,0 +1,252 @@
+---
+title: "hyperparameter-tuning"
+format: html
+editor: visual
+---
+
+DATA IMPORT/ TIDY/ TRANSFORM
+```{r}
+#Library Loading:
+
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(readr)
+```
+
+```{r}
+# Data Ingest:
+
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+remote_files  <- glue('{root}/camels_{types}.txt')
+
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+camels <- power_full_join(camels ,by = 'gauge_id')
+
+```
+
+```{r}
+# Data Cleaning:
+
+drop_na(camels)
+mutate(logC = log(season_cases +1))
+
+```
+
+DATA SPLITTING 
+```{r}
+# Initial Split
+set.seed(123)
+
+camels_split <- initial_split(camels, prop = 0.8)
+
+#Training/ Testing
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+```
+
+FEATURE ENGINEERING
+```{r}
+# Proper Recipe
+
+rec <-  recipe(q_mean ~ ., data = camels_train) %>%
+  step_rm(gauge_lat, gauge_lon, gauge_id, high_prec_timing, low_prec_timing, geol_1st_class, geol_2nd_class, dom_land_cover) %>%
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+DATA RESAMPLING AND MODEL TESTING
+```{r}
+# Cross Validation Data Set
+camels_cv <- vfold_cv(camels_train, v = 10)
+```
+
+```{r}
+# Define Three Regression Models
+
+# Linear Regression
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+# Random Forest Regression
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+#XG Boost
+b_model <- boost_tree() |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+```
+
+
+```{r}
+# Workflow Set/ Map/ Autoplot
+
+wf <- workflow_set(list(rec), list(b_model, rf_model, lm_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv)
+
+autoplot(wf)
+```
+Model Selection With Justification:
+
+I think the Linear Regression Model performs the best, because it has the highest r squared value out and the lowest root mean squared error out of all the data. 
+
+I am choosing the Linear Regression Model. It's engine is "lm" and it's in regression mode. I think that it's performing well for this problem because it fundamentally measures the relationship between a dependent variable (q_mean) and an independent variable (all of the other variables,) and is commonly used in environmental science.
+
+MODEL TUNING
+```{r}
+#Tunable Model Set Up:
+
+#Even though linear regression had the best metrics, it wasn't working for the tuning, so I changed it to random forest and now it works. 
+
+library(tune)
+#install.packages("bonsai")
+library(bonsai)
+
+
+rf_model_tune <- rand_forest(trees = tune(), min_n = tune()) |>
+  set_engine("ranger") |> 
+  set_mode("regression")
+
+# Tunable Workflow Defined:
+
+wf_tune <- workflow() %>%
+  add_model(rf_model_tune) %>%
+  add_recipe(rec)
+
+camels_metrics = metric_set(rsq, rmse, mae)
+
+# Description of Dial Ranges:
+
+dials <- extract_parameter_set_dials(wf_tune)
+dials$object
+
+# Define Search Space:
+
+my.grid <- dials |> 
+  update(trees = trees(c(50, 500))) |>
+  grid_latin_hypercube(size = 20)
+
+range(my.grid$trees)
+
+```
+```{r}
+# Tune the Model
+model_params <-  tune_grid(
+    wf_tune,
+    resamples = camels_cv,
+    grid = my.grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = TRUE)
+  )
+
+autoplot(model_params)
+```
+As the minimal node size increases, mean absolute error and root mean squared error increase while r squared decreases. Number of trees has no affect on any of the metrics, as the scatter plots are completely random. 
+
+CHECK SKILL OF TUNED MODEL
+```{r}
+# Collect Metrics
+
+collect_metrics(model_params)
+```
+How do I arrange for descending values but keep all organized ??
+
+```{r}
+# Show Best
+
+show_best(model_params, metric = "rsq")
+show_best(model_params, metric = "rmse")
+show_best(model_params, metric = "mae")
+```
+
+mean absolute error is lowest when there are 465 trees and a min_n of 3. 
+
+```{r}
+# Select Best 
+
+hp_best <- select_best(model_params, metric = "rsq")
+```
+
+FINALIZE YOUR MODEL
+```{r}
+# Finalize Workflow
+
+final_wf <- finalize_workflow(wf_tune, hp_best)
+```
+
+FINAL MODEL VERIFICATION
+```{r}
+# Implement Last Fit
+
+final_fit <- last_fit(final_wf, camels_split, metrics = camels_metrics)
+
+# Collect Metrics 
+collect_metrics(final_fit)
+```
+
+```{r}
+# Collect Predictions 
+
+#Plots
+
+collect_predictions(final_fit) |> 
+  ggplot(aes(x = .pred, y = q_mean)) + 
+  geom_point() +
+  geom_abline() + 
+  geom_smooth(method = "lm") + 
+  theme_linedraw() + 
+  labs(title = "Actual VS Predicted q_mean", 
+       x = "Predicted (Log10)", 
+       y = "Actual (Log10)")
+
+```
+
+
+BUILDING A MAP
+```{r}
+
+library(patchwork)
+
+final <- fit(final_wf, data = camels) %>%
+  augment(new_data = camels) %>%
+  mutate(residuals = .pred - q_mean)
+
+names(final_fit)
+
+# Map of Residuals
+Residuals <- ggplot(data = final, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = residuals)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+
+# Map of Predictions
+Predictions <- ggplot(data = final, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = .pred)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+
+Residuals + Predictions
+
+combined <- Residuals + Predictions
+print(combined)
+```
+
+
