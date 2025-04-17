@@ -43,7 +43,8 @@ camels <- power_full_join(camels ,by = 'gauge_id')
 # Data Cleaning:
 
 drop_na(camels)
-mutate(logC = log(season_cases +1))
+camels %>% 
+  mutate(logC = log(q_mean +1))
 
 ```
 
